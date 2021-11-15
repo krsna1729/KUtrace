@@ -1,0 +1,763 @@
+From 62c45956949a4c19b7d2c30ae6a43f330c5ec2e2 Mon Sep 17 00:00:00 2001
+From: Saikrishna Edupuganti <saikrishna.edupuganti@intel.com>
+Date: Mon, 15 Nov 2021 04:21:27 +0000
+Subject: [PATCH] mechanical port of KUTrace changes to 5.15.2
+
+Signed-off-by: Saikrishna Edupuganti <saikrishna.edupuganti@intel.com>
+---
+ arch/x86/Kconfig              |   6 ++
+ arch/x86/entry/common.c       |  27 ++++++
+ arch/x86/kernel/acpi/cstate.c |   5 ++
+ arch/x86/kernel/apic/apic.c   |  10 +++
+ arch/x86/kernel/apic/ipi.c    |  11 +++
+ arch/x86/kernel/irq.c         |  15 ++++
+ arch/x86/kernel/irq_work.c    |  11 ++-
+ arch/x86/kernel/smp.c         |  19 +++++
+ arch/x86/mm/fault.c           |   9 ++
+ drivers/acpi/acpi_pad.c       |   5 ++
+ drivers/acpi/processor_idle.c |   5 ++
+ drivers/idle/intel_idle.c     |   7 ++
+ include/linux/kutrace.h       | 154 ++++++++++++++++++++++++++++++++++
+ kernel/Makefile               |   3 +
+ kernel/kutrace/Makefile       |   3 +
+ kernel/kutrace/kutrace.c      |  46 ++++++++++
+ kernel/sched/core.c           |  17 ++++
+ kernel/softirq.c              |  10 +++
+ 18 files changed, 362 insertions(+), 1 deletion(-)
+ create mode 100644 include/linux/kutrace.h
+ create mode 100644 kernel/kutrace/Makefile
+ create mode 100644 kernel/kutrace/kutrace.c
+
+diff --git a/arch/x86/Kconfig b/arch/x86/Kconfig
+index d9830e7e1..af96b4c14 100644
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@ -35,6 +35,12 @@ config X86_64
+ 	select ARCH_HAS_ELFCORE_COMPAT
+ 	select ZONE_DMA32
+ 
++# dsites 2019.02.17
++config KUTRACE
++	bool "kernel-user tracing, dsites"
++	depends on 64BIT
++	def_bool n
++
+ config FORCE_DYNAMIC_FTRACE
+ 	def_bool y
+ 	depends on X86_32
+diff --git a/arch/x86/entry/common.c b/arch/x86/entry/common.c
+index 6c2826417..e2eaeee90 100644
+--- a/arch/x86/entry/common.c
++++ b/arch/x86/entry/common.c
+@@ -37,6 +37,9 @@
+ 
+ #ifdef CONFIG_X86_64
+ 
++/* dsites 2019.03.01 */
++#include <linux/kutrace.h>
++
+ static __always_inline bool do_syscall_x64(struct pt_regs *regs, int nr)
+ {
+ 	/*
+@@ -47,8 +50,32 @@ static __always_inline bool do_syscall_x64(struct pt_regs *regs, int nr)
+ 
+ 	if (likely(unr < NR_syscalls)) {
+ 		unr = array_index_nospec(unr, NR_syscalls);
++		/* dsites 2019.03.05 track all syscalls and normal returns */
++		/* Pass in low 16 bits of call arg0 and return value */
++		kutrace1(KUTRACE_SYSCALL64 | kutrace_map_nr(unr), regs->di & 0xFFFFul);
++
+ 		regs->ax = sys_call_table[unr](regs);
++		
++		/* dsites 2019.03.05 track all syscalls and normal returns */
++		/* Pass in low 16 bits of return value */
++		kutrace1(KUTRACE_SYSRET64 | kutrace_map_nr(nr), regs->ax & 0xFFFFul);
+ 		return true;
++#ifdef CONFIG_KUTRACE
++	/* dsites 2019.03.03 hook for controlling kutrace */
++	} else if ((nr == __NR_kutrace_control) && 
++	           (kutrace_global_ops.kutrace_trace_control != NULL)) {
++		BUILD_BUG_ON_MSG(NR_syscalls > __NR_kutrace_control, 
++				"__NR_kutrace_control is too small");
++		BUILD_BUG_ON_MSG(16 > TASK_COMM_LEN, 
++				"TASK_COMM_LEN is less than 16");
++
++		/* Calling kutrace_control(u64 command, u64 arg) */
++		/* see arch/x86/calling.h: */
++		/*  syscall arg0 in rdi (command), arg1 in rsi (arg) */
++		regs->ax = (*kutrace_global_ops.kutrace_trace_control)(
++			regs->di, regs->si);
++		return true;
++#endif
+ 	}
+ 	return false;
+ }
+diff --git a/arch/x86/kernel/acpi/cstate.c b/arch/x86/kernel/acpi/cstate.c
+index 7de599eba..6f383534c 100644
+--- a/arch/x86/kernel/acpi/cstate.c
++++ b/arch/x86/kernel/acpi/cstate.c
+@@ -16,6 +16,9 @@
+ #include <asm/mwait.h>
+ #include <asm/special_insns.h>
+ 
++/* dsites 2019.03.12 */
++#include <linux/kutrace.h>
++
+ /*
+  * Initialize bm_flags based on the CPU cache properties
+  * On SMP it depends on cache configuration
+@@ -187,6 +190,8 @@ void __cpuidle acpi_processor_ffh_cstate_enter(struct acpi_processor_cx *cx)
+ 	struct cstate_entry *percpu_entry;
+ 
+ 	percpu_entry = per_cpu_ptr(cpu_cstate_entry, cpu);
++	/* dsites 2019.03.12 */
++	kutrace1(KUTRACE_MWAIT, percpu_entry->states[cx->index].eax);
+ 	mwait_idle_with_hints(percpu_entry->states[cx->index].eax,
+ 	                      percpu_entry->states[cx->index].ecx);
+ }
+diff --git a/arch/x86/kernel/apic/apic.c b/arch/x86/kernel/apic/apic.c
+index b70344bf6..5396e7919 100644
+--- a/arch/x86/kernel/apic/apic.c
++++ b/arch/x86/kernel/apic/apic.c
+@@ -62,6 +62,9 @@
+ #include <asm/intel-family.h>
+ #include <asm/irq_regs.h>
+ 
++/* dsites 2019.03.01 */
++#include <linux/kutrace.h>
++
+ unsigned int num_processors;
+ 
+ unsigned disabled_cpus;
+@@ -1099,10 +1102,17 @@ DEFINE_IDTENTRY_SYSVEC(sysvec_apic_timer_interrupt)
+ 	struct pt_regs *old_regs = set_irq_regs(regs);
+ 
+ 	ack_APIC_irq();
++
++	/* dsites 2019.03.05  */
++	kutrace1(KUTRACE_IRQ + LOCAL_TIMER_VECTOR, 0);
++
+ 	trace_local_timer_entry(LOCAL_TIMER_VECTOR);
+ 	local_apic_timer_interrupt();
+ 	trace_local_timer_exit(LOCAL_TIMER_VECTOR);
+ 
++	/* dsites 2019.03.05  */
++	kutrace1(KUTRACE_IRQRET + LOCAL_TIMER_VECTOR, 0);
++
+ 	set_irq_regs(old_regs);
+ }
+ 
+diff --git a/arch/x86/kernel/apic/ipi.c b/arch/x86/kernel/apic/ipi.c
+index d1fb874fb..6bcfc7394 100644
+--- a/arch/x86/kernel/apic/ipi.c
++++ b/arch/x86/kernel/apic/ipi.c
+@@ -4,6 +4,9 @@
+ #include <linux/smp.h>
+ #include <asm/io_apic.h>
+ 
++/* dsites 2019.03.01 */
++#include <linux/kutrace.h>
++
+ #include "local.h"
+ 
+ DEFINE_STATIC_KEY_FALSE(apic_use_ipi_shorthand);
+@@ -68,16 +71,24 @@ void native_smp_send_reschedule(int cpu)
+ 		WARN(1, "sched: Unexpected reschedule of offline CPU#%d!\n", cpu);
+ 		return;
+ 	}
++	/* dsites 2019.03.06 */
++	kutrace1(KUTRACE_IPI, cpu);
+ 	apic->send_IPI(cpu, RESCHEDULE_VECTOR);
+ }
+ 
+ void native_send_call_func_single_ipi(int cpu)
+ {
++	/* dsites 2019.03.06 */
++	kutrace1(KUTRACE_IPI, cpu);
+ 	apic->send_IPI(cpu, CALL_FUNCTION_SINGLE_VECTOR);
+ }
+ 
+ void native_send_call_func_ipi(const struct cpumask *mask)
+ {
++	/* dsites 2019.03.06 */
++	/* Use CPU 0 as a placeholder to indicate when mask was sent */
++	kutrace1(KUTRACE_IPI, 0);
++
+ 	if (static_branch_likely(&apic_use_ipi_shorthand)) {
+ 		unsigned int cpu = smp_processor_id();
+ 
+diff --git a/arch/x86/kernel/irq.c b/arch/x86/kernel/irq.c
+index e28f6a5d1..b6c1b029c 100644
+--- a/arch/x86/kernel/irq.c
++++ b/arch/x86/kernel/irq.c
+@@ -26,6 +26,9 @@
+ #define CREATE_TRACE_POINTS
+ #include <asm/trace/irq_vectors.h>
+ 
++/* dsites 2019.03.05 */
++#include <linux/kutrace.h>
++
+ DEFINE_PER_CPU_SHARED_ALIGNED(irq_cpustat_t, irq_stat);
+ EXPORT_PER_CPU_SYMBOL(irq_stat);
+ 
+@@ -242,6 +245,9 @@ DEFINE_IDTENTRY_IRQ(common_interrupt)
+ 	struct pt_regs *old_regs = set_irq_regs(regs);
+ 	struct irq_desc *desc;
+ 
++	/* dsites 2019.03.05 */
++	kutrace1(KUTRACE_IRQ + (vector & 0xFF), 0);
++
+ 	/* entry code tells RCU that we're not quiescent.  Check it. */
+ 	RCU_LOCKDEP_WARN(!rcu_is_watching(), "IRQ failed to wake up RCU");
+ 
+@@ -260,6 +266,9 @@ DEFINE_IDTENTRY_IRQ(common_interrupt)
+ 		}
+ 	}
+ 
++	/* dsites 2019.03.05 */
++	kutrace1(KUTRACE_IRQRET + (vector & 0xFF), 0);
++
+ 	set_irq_regs(old_regs);
+ }
+ 
+@@ -274,11 +283,17 @@ DEFINE_IDTENTRY_SYSVEC(sysvec_x86_platform_ipi)
+ 	struct pt_regs *old_regs = set_irq_regs(regs);
+ 
+ 	ack_APIC_irq();
++	/* dsites 2019.03.06 */
++	kutrace1(KUTRACE_IRQ + X86_PLATFORM_IPI_VECTOR, 0);
++
+ 	trace_x86_platform_ipi_entry(X86_PLATFORM_IPI_VECTOR);
+ 	inc_irq_stat(x86_platform_ipis);
+ 	if (x86_platform_ipi_callback)
+ 		x86_platform_ipi_callback();
+ 	trace_x86_platform_ipi_exit(X86_PLATFORM_IPI_VECTOR);
++
++	/* dsites 2019.03.06 */
++	kutrace1(KUTRACE_IRQRET + X86_PLATFORM_IPI_VECTOR, 0);
+ 	set_irq_regs(old_regs);
+ }
+ #endif
+diff --git a/arch/x86/kernel/irq_work.c b/arch/x86/kernel/irq_work.c
+index 890d4778c..de4e0a5b2 100644
+--- a/arch/x86/kernel/irq_work.c
++++ b/arch/x86/kernel/irq_work.c
+@@ -13,14 +13,23 @@
+ #include <asm/trace/irq_vectors.h>
+ #include <linux/interrupt.h>
+ 
++/* dsites 2019.03.06 */
++#include <linux/kutrace.h>
++
+ #ifdef CONFIG_X86_LOCAL_APIC
+ DEFINE_IDTENTRY_SYSVEC(sysvec_irq_work)
+ {
+-	ack_APIC_irq();
++	ack_APIC_irq();	
++	/* dsites 2019.03.06 */
++	kutrace1(KUTRACE_IRQ + IRQ_WORK_VECTOR, 0);
++
+ 	trace_irq_work_entry(IRQ_WORK_VECTOR);
+ 	inc_irq_stat(apic_irq_work_irqs);
+ 	irq_work_run();
+ 	trace_irq_work_exit(IRQ_WORK_VECTOR);
++	
++	/* dsites 2019.03.06 */
++	kutrace1(KUTRACE_IRQRET + IRQ_WORK_VECTOR, 0);
+ }
+ 
+ void arch_irq_work_raise(void)
+diff --git a/arch/x86/kernel/smp.c b/arch/x86/kernel/smp.c
+index 06db901fa..59e84791b 100644
+--- a/arch/x86/kernel/smp.c
++++ b/arch/x86/kernel/smp.c
+@@ -34,6 +34,9 @@
+ #include <asm/kexec.h>
+ #include <asm/virtext.h>
+ 
++/* dsites 2019.03.01 */
++#include <linux/kutrace.h>
++
+ /*
+  *	Some notes on x86 processor bugs affecting SMP operation:
+  *
+@@ -225,28 +228,44 @@ static void native_stop_other_cpus(int wait)
+ DEFINE_IDTENTRY_SYSVEC_SIMPLE(sysvec_reschedule_ipi)
+ {
+ 	ack_APIC_irq();
++	/* dsites 2019.03.06 */
++	kutrace1(KUTRACE_IRQ + RESCHEDULE_VECTOR, 0);
++
+ 	trace_reschedule_entry(RESCHEDULE_VECTOR);
+ 	inc_irq_stat(irq_resched_count);
+ 	scheduler_ipi();
+ 	trace_reschedule_exit(RESCHEDULE_VECTOR);
++	/* dsites 2019.03.06 continued in sched/core.c */
++
+ }
+ 
+ DEFINE_IDTENTRY_SYSVEC(sysvec_call_function)
+ {
+ 	ack_APIC_irq();
++	/* dsites 2019.03.06 */
++	kutrace1(KUTRACE_IRQ + CALL_FUNCTION_VECTOR, 0);
++
+ 	trace_call_function_entry(CALL_FUNCTION_VECTOR);
+ 	inc_irq_stat(irq_call_count);
+ 	generic_smp_call_function_interrupt();
+ 	trace_call_function_exit(CALL_FUNCTION_VECTOR);
++	/* dsites 2019.03.06 */
++	kutrace1(KUTRACE_IRQRET + CALL_FUNCTION_VECTOR, 0);
++
+ }
+ 
+ DEFINE_IDTENTRY_SYSVEC(sysvec_call_function_single)
+ {
+ 	ack_APIC_irq();
++	/* dsites 2019.03.06 */
++	kutrace1(KUTRACE_IRQ + CALL_FUNCTION_SINGLE_VECTOR, 0);
++
+ 	trace_call_function_single_entry(CALL_FUNCTION_SINGLE_VECTOR);
+ 	inc_irq_stat(irq_call_count);
+ 	generic_smp_call_function_single_interrupt();
+ 	trace_call_function_single_exit(CALL_FUNCTION_SINGLE_VECTOR);
++	/* dsites 2019.03.06 */
++	kutrace1(KUTRACE_IRQRET + CALL_FUNCTION_SINGLE_VECTOR, 0);
+ }
+ 
+ static int __init nonmi_ipi_setup(char *str)
+diff --git a/arch/x86/mm/fault.c b/arch/x86/mm/fault.c
+index 84a2c8c4a..e6a12715d 100644
+--- a/arch/x86/mm/fault.c
++++ b/arch/x86/mm/fault.c
+@@ -36,6 +36,9 @@
+ #define CREATE_TRACE_POINTS
+ #include <asm/trace/exceptions.h>
+ 
++/* dsites 2019.03.01 */
++#include <linux/kutrace.h>
++
+ /*
+  * Returns 0 if mmiotrace is disabled, or if the fault is not
+  * handled by mmiotrace:
+@@ -1538,7 +1541,13 @@ DEFINE_IDTENTRY_RAW_ERRORCODE(exc_page_fault)
+ 	state = irqentry_enter(regs);
+ 
+ 	instrumentation_begin();
++	/* dsites 2019.03.01 */
++	kutrace1(KUTRACE_TRAP + KUTRACE_PAGEFAULT, 0);
++
+ 	handle_page_fault(regs, error_code, address);
++
++	/* dsites 2019.03.01 */
++	kutrace1(KUTRACE_TRAPRET + KUTRACE_PAGEFAULT, 0);
+ 	instrumentation_end();
+ 
+ 	irqentry_exit(regs, state);
+diff --git a/drivers/acpi/acpi_pad.c b/drivers/acpi/acpi_pad.c
+index f45979aa2..7a71beb51 100644
+--- a/drivers/acpi/acpi_pad.c
++++ b/drivers/acpi/acpi_pad.c
+@@ -20,6 +20,9 @@
+ #include <asm/mwait.h>
+ #include <xen/xen.h>
+ 
++/* dsites 2019.03.12 */
++#include <linux/kutrace.h>
++
+ #define ACPI_PROCESSOR_AGGREGATOR_CLASS	"acpi_pad"
+ #define ACPI_PROCESSOR_AGGREGATOR_DEVICE_NAME "Processor Aggregator"
+ #define ACPI_PROCESSOR_AGGREGATOR_NOTIFY 0x80
+@@ -168,6 +171,8 @@ static int power_saving_thread(void *data)
+ 			tick_broadcast_enter();
+ 			stop_critical_timings();
+ 
++			/* dsites 2019.03.12 */
++			kutrace1(KUTRACE_MWAIT, power_saving_mwait_eax);
+ 			mwait_idle_with_hints(power_saving_mwait_eax, 1);
+ 
+ 			start_critical_timings();
+diff --git a/drivers/acpi/processor_idle.c b/drivers/acpi/processor_idle.c
+index f37fba9e5..f75f020a6 100644
+--- a/drivers/acpi/processor_idle.c
++++ b/drivers/acpi/processor_idle.c
+@@ -22,6 +22,9 @@
+ #include <linux/cpu.h>
+ #include <acpi/processor.h>
+ 
++/* dsites 2019.03.06 */
++#include <linux/kutrace.h>
++
+ /*
+  * Include the apic definitions for x86 to have the APIC timer related defines
+  * available also for UP (on SMP it gets magically included via linux/smp.h).
+@@ -553,6 +556,8 @@ static void __cpuidle acpi_idle_do_entry(struct acpi_processor_cx *cx)
+ 		acpi_safe_halt();
+ 	} else {
+ 		/* IO port based C-state */
++		/* dsites 2019.03.06 */
++		kutrace1(KUTRACE_MWAIT, 255);	/* Flag to make this patch distinctive */
+ 		inb(cx->address);
+ 		wait_for_freeze();
+ 	}
+diff --git a/drivers/idle/intel_idle.c b/drivers/idle/intel_idle.c
+index e6c543b5e..8fa482f1d 100644
+--- a/drivers/idle/intel_idle.c
++++ b/drivers/idle/intel_idle.c
+@@ -57,6 +57,9 @@
+ 
+ #define INTEL_IDLE_VERSION "0.5.1"
+ 
++/* dsites 2019.03.12 */
++#include <linux/kutrace.h>
++
+ static struct cpuidle_driver intel_idle_driver = {
+ 	.name = "intel_idle",
+ 	.owner = THIS_MODULE,
+@@ -127,6 +130,8 @@ static __cpuidle int intel_idle(struct cpuidle_device *dev,
+ 	unsigned long eax = flg2MWAIT(state->flags);
+ 	unsigned long ecx = 1; /* break on interrupt flag */
+ 
++	/* dsites 2019.03.12 */
++	kutrace1(KUTRACE_MWAIT, eax);
+ 	mwait_idle_with_hints(eax, ecx);
+ 
+ 	return index;
+@@ -150,6 +155,8 @@ static __cpuidle int intel_idle_s2idle(struct cpuidle_device *dev,
+ 	unsigned long eax = flg2MWAIT(drv->states[index].flags);
+ 	unsigned long ecx = 1; /* break on interrupt flag */
+ 
++	/* dsites 2019.03.12 */
++	kutrace1(KUTRACE_MWAIT, eax);
+ 	mwait_idle_with_hints(eax, ecx);
+ 
+ 	return 0;
+diff --git a/include/linux/kutrace.h b/include/linux/kutrace.h
+new file mode 100644
+index 000000000..e0d38d572
+--- /dev/null
++++ b/include/linux/kutrace.h
+@@ -0,0 +1,154 @@
++/*
++ * include/linux/kutrace.h
++ *
++ * Copyright (C) 2019 Richard L. Sites
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++
++/*
++ * hooks for kernel/user tracing
++ * dsites 2019.02.14
++ *
++ */
++
++#ifndef _LINUX_KUTRACE_H
++#define _LINUX_KUTRACE_H
++
++#include <linux/types.h>
++
++/* Updated 2019.03.03 to allow 64-bit syscalls 0..510 and */
++/*  32-bit syscalls 512..1022 */
++
++/* Take over last syscall number for controlling kutrace */
++#define __NR_kutrace_control 1023
++
++/* Take over last syscall64 number for tracing scheduler call/return */
++#define KUTRACE_SCHEDSYSCALL 511
++
++/* kutrace_control() commands */
++#define KUTRACE_CMD_OFF 0
++#define KUTRACE_CMD_ON 1
++#define KUTRACE_CMD_FLUSH 2
++#define KUTRACE_CMD_RESET 3
++#define KUTRACE_CMD_STAT 4
++#define KUTRACE_CMD_GETCOUNT 5
++#define KUTRACE_CMD_GETWORD 6
++#define KUTRACE_CMD_INSERT1 7
++#define KUTRACE_CMD_INSERTN 8
++#define KUTRACE_CMD_GETIPCWORD 9
++#define KUTRACE_CMD_TEST 10
++#define KUTRACE_CMD_VERSION 11
++
++
++/* This is a shortened list of kernel-mode raw trace 12-bit event numbers */
++/* See user-mode kutrace_lib.h for the full set */
++
++/* Entry to provide names for PIDs */
++#define KUTRACE_PIDNAME       0x002
++
++// Specials are point events
++#define KUTRACE_USERPID       0x200	/* Context switch: new PID */
++#define KUTRACE_RPCIDREQ      0x201
++#define KUTRACE_RPCIDRESP     0x202
++#define KUTRACE_RPCIDMID      0x203
++#define KUTRACE_RPCIDRXPKT    0x204
++#define KUTRACE_RPCIDTXPKT    0x205
++#define KUTRACE_RUNNABLE      0x206  /* Set process runnable: PID */
++#define KUTRACE_IPI           0x207  /* Send IPI; receive is interrupt */
++#define KUTRACE_MWAIT         0x208	/* C-states */
++#define KUTRACE_PSTATE        0x209	/* P-states */
++
++
++/* These are in blocks of 256 numbers */
++#define KUTRACE_TRAP      0x0400     /* AKA fault */
++#define KUTRACE_IRQ       0x0500
++#define KUTRACE_TRAPRET   0x0600
++#define KUTRACE_IRQRET    0x0700
++
++
++/* These are in blocks of 512 numbers */
++#define KUTRACE_SYSCALL64 0x0800
++#define KUTRACE_SYSRET64  0x0A00
++#define KUTRACE_SYSCALL32 0x0C00
++#define KUTRACE_SYSRET32  0x0E00
++
++/* Specific trap number for page fault */
++#define KUTRACE_PAGEFAULT  14
++
++/* Specific IRQ numbers. See arch/x86/include/asm/irq_vectors.h */
++/* unneeded #define KUTRACE_LOCAL_TIMER_VECTOR		0xec */
++
++/* Reuse the spurious_apic vector to show bottom halves exeuting */
++#define KUTRACE_BOTTOM_HALF	255
++
++
++
++/* Procedure interface to loadable module or compiled-in kutrace.c */
++struct kutrace_ops {
++	void (*kutrace_trace_1)(u64 num, u64 arg);
++	void (*kutrace_trace_2)(u64 num, u64 arg1, u64 arg2);
++	void (*kutrace_trace_many)(u64 num, u64 len, const char *arg);
++	u64 (*kutrace_trace_control)(u64 command, u64 arg);
++};
++
++/* Per-cpu struct */
++struct kutrace_traceblock {
++	atomic64_t next;	/* Next u64 in current per-cpu trace block */
++	u64 *limit;		/* Off-the-end u64 in current per-cpu block */
++	u64 prior_cycles;	/* IPC tracking */
++	u64 prior_inst_retired;	/* IPC tracking */
++};
++
++
++#ifdef CONFIG_KUTRACE
++/* Global variables used by kutrace. Defined in kernel/kutrace/kutrace.c */
++extern bool kutrace_tracing;
++extern struct kutrace_ops kutrace_global_ops;
++extern u64 *kutrace_pid_filter;
++
++/* Insert pid name if first time seen. Races don't matter here. */
++#define kutrace_pidname(next) \
++	if (kutrace_tracing) { \
++		pid_t pid16 = next->pid & 0xffff; \
++		pid_t pid_hi = pid16 >> 6; \
++		u64 pid_bit = 1ul << (pid16 & 0x3f); \
++		if ((kutrace_pid_filter[pid_hi] & pid_bit) == 0) { \
++			u64 name_entry[3]; \
++			name_entry[0] = pid16; \
++			memcpy(&name_entry[1], next->comm, 16); \
++			(*kutrace_global_ops.kutrace_trace_many)( \
++			 KUTRACE_PIDNAME, 3l, (const char*)&name_entry[0]); \
++			kutrace_pid_filter[pid_hi] |= pid_bit; \
++		} \
++	}
++
++#define	kutrace1(event, arg) \
++	if (kutrace_tracing) { \
++		(*kutrace_global_ops.kutrace_trace_1)(event, arg); \
++	}
++
++/* map_nr moves 32-bit syscalls 0x200..3FF to 0x400..5FF */
++#define	kutrace_map_nr(nr) (nr + (nr & 0x200)) 
++
++#else
++
++#define	kutrace_pidname(next)
++#define	kutrace1(event, arg)
++#define	kutrace_map_nr(nr) (nr) 
++
++#endif
++
++
++#endif /* _LINUX_KUTRACE_H */
+diff --git a/kernel/Makefile b/kernel/Makefile
+index 4df609be4..4af7ee3ac 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -159,3 +159,6 @@ $(obj)/kheaders_data.tar.xz: FORCE
+ 	$(call cmd,genikh)
+ 
+ clean-files := kheaders_data.tar.xz kheaders.md5
++
++# dsites 2019.02.16
++obj-y += kutrace/
+diff --git a/kernel/kutrace/Makefile b/kernel/kutrace/Makefile
+new file mode 100644
+index 000000000..82cbd26ca
+--- /dev/null
++++ b/kernel/kutrace/Makefile
+@@ -0,0 +1,3 @@
++# dsites 2019.02.16
++obj-$(CONFIG_KUTRACE) += kutrace.o
++
+diff --git a/kernel/kutrace/kutrace.c b/kernel/kutrace/kutrace.c
+new file mode 100644
+index 000000000..aa0194c0f
+--- /dev/null
++++ b/kernel/kutrace/kutrace.c
+@@ -0,0 +1,46 @@
++/*
++ * kernel/kutrace/kutrace.c
++ *
++ * Copyright (C) 2019 Richard L. Sites
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++
++/*
++ * Small hooks for a module that implements kernel/user tracing
++ * dsites 2019.02.14 Reworked for the 4.19 kernel from dclab_trace.c 
++ *
++ * See include/linux/kutrace.h for struct definitions
++ *
++ * Most patches will be something like
++ *   kutrace1(event, arg)
++ *
++ */
++
++#include <linux/kutrace.h>
++#include <linux/kernel.h>
++#include <linux/percpu.h>
++#include <linux/types.h>
++
++bool kutrace_tracing = false;
++EXPORT_SYMBOL(kutrace_tracing);
++
++struct kutrace_ops kutrace_global_ops = {NULL, NULL, NULL, NULL};
++EXPORT_SYMBOL(kutrace_global_ops);
++
++u64* kutrace_pid_filter = NULL;
++EXPORT_SYMBOL(kutrace_pid_filter);
++
++DEFINE_PER_CPU(struct kutrace_traceblock, kutrace_traceblock_per_cpu);
++EXPORT_PER_CPU_SYMBOL(kutrace_traceblock_per_cpu);
+diff --git a/kernel/sched/core.c b/kernel/sched/core.c
+index f21714ea3..30a4d5f2f 100644
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -44,6 +44,9 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(sched_update_nr_running_tp);
+ 
+ DEFINE_PER_CPU_SHARED_ALIGNED(struct rq, runqueues);
+ 
++/* dsites 2019.03.01 */
++#include <linux/kutrace.h>
++
+ #ifdef CONFIG_SCHED_DEBUG
+ /*
+  * Debugging: various feature bits
+@@ -3967,6 +3970,8 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
+ 			goto out;
+ 
+ 		trace_sched_waking(p);
++		/* dsites 2019.03.05 */
++		kutrace1(KUTRACE_RUNNABLE, p->pid);
+ 		WRITE_ONCE(p->__state, TASK_RUNNING);
+ 		trace_sched_wakeup(p);
+ 		goto out;
+@@ -3984,6 +3989,8 @@ try_to_wake_up(struct task_struct *p, unsigned int state, int wake_flags)
+ 		goto unlock;
+ 
+ 	trace_sched_waking(p);
++	/* dsites 2019.03.05 */
++	kutrace1(KUTRACE_RUNNABLE, p->pid);
+ 
+ 	/*
+ 	 * Ensure we load p->on_rq _after_ p->state, otherwise it would
+@@ -6171,6 +6178,9 @@ static void __sched notrace __schedule(unsigned int sched_mode)
+ 	struct rq *rq;
+ 	int cpu;
+ 
++	/* dsites 2019.03.01 */
++	kutrace1(KUTRACE_SYSCALL64 + KUTRACE_SCHEDSYSCALL, 0);
++
+ 	cpu = smp_processor_id();
+ 	rq = cpu_rq(cpu);
+ 	prev = rq->curr;
+@@ -6282,6 +6292,10 @@ static void __sched notrace __schedule(unsigned int sched_mode)
+ 		psi_sched_switch(prev, next, !task_on_rq_queued(prev));
+ 
+ 		trace_sched_switch(sched_mode & SM_MASK_PREEMPT, prev, next);
++		/* dsites 2019.03.05 */
++		/* Put pid name into trace first time */
++		kutrace_pidname(next);
++		kutrace1(KUTRACE_USERPID, next->pid);
+ 
+ 		/* Also unlocks the rq: */
+ 		rq = context_switch(rq, prev, next, &rf);
+@@ -6292,6 +6306,9 @@ static void __sched notrace __schedule(unsigned int sched_mode)
+ 		__balance_callbacks(rq);
+ 		raw_spin_rq_unlock_irq(rq);
+ 	}
++	
++	/* dsites 2019.03.01 */
++	kutrace1(KUTRACE_SYSRET64 + KUTRACE_SCHEDSYSCALL, 0);
+ }
+ 
+ void __noreturn do_task_dead(void)
+diff --git a/kernel/softirq.c b/kernel/softirq.c
+index 322b65d45..867a20026 100644
+--- a/kernel/softirq.c
++++ b/kernel/softirq.c
+@@ -33,6 +33,9 @@
+ #define CREATE_TRACE_POINTS
+ #include <trace/events/irq.h>
+ 
++/* dsites 2019.03.01 */
++#include <linux/kutrace.h>
++
+ /*
+    - No shared variables, all the data are CPU local.
+    - If a softirq needs serialization, let it serialize itself
+@@ -554,9 +557,16 @@ asmlinkage __visible void __softirq_entry __do_softirq(void)
+ 
+ 		kstat_incr_softirqs_this_cpu(vec_nr);
+ 
++		/* dsites 2019.03.06 */
++		kutrace1(KUTRACE_IRQ + KUTRACE_BOTTOM_HALF, vec_nr);
++
+ 		trace_softirq_entry(vec_nr);
+ 		h->action(h);
+ 		trace_softirq_exit(vec_nr);
++		
++		/* dsites 2019.03.06 */
++		kutrace1(KUTRACE_IRQRET + KUTRACE_BOTTOM_HALF, 0);
++
+ 		if (unlikely(prev_count != preempt_count())) {
+ 			pr_err("huh, entered softirq %u %s %p with preempt_count %08x, exited with %08x?\n",
+ 			       vec_nr, softirq_to_name[vec_nr], h->action,
+-- 
+2.25.1
+
