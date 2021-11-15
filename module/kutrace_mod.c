@@ -306,10 +306,10 @@ printk(KERN_INFO "kutrace_ipc_mod rdMSR(0xC0010015) = %016llx\n", inst_ret_enabl
 }
 
 /* choose later */
-inline u64 get_inst_retired(void) {return get_inst_retired_amd();}
+inline u64 get_inst_retired(void) {return get_inst_retired_intel();}
 
 /* choose later */
-inline void setup_get_inst_retired(void) {setup_get_inst_retired_amd();}
+inline void setup_get_inst_retired(void) {setup_get_inst_retired_intel();}
 
 
 

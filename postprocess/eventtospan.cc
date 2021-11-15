@@ -90,7 +90,7 @@
 // Additional drawing events
 #define ArcNum       	-3
 
-static const int kMAX_CPUS = 80;
+static const int kMAX_CPUS = 256;
 
 using std::string;
 using std::map;
